@@ -1,0 +1,1046 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "100% automated. Works in brand-new AWS accounts. Service-linked roles created automatically. Lambda uploads Dockerfile + index.html to S3, CodeBuild builds & pushes to ECR, ECS Service only starts after the image is confirmed in ECR. No manual steps required.",
+  "Parameters": {
+    "AppName": {
+      "Type": "String",
+      "Description": "Base name applied to every resource."
+    },
+    "CheckAcknowledgement": {
+      "Type": "String",
+      "Default": "TRUE",
+      "AllowedValues": [
+        "TRUE",
+        "FALSE"
+      ],
+      "Description": "Set TRUE to acknowledge CAPABILITY_NAMED_IAM is required."
+    },
+    "DeployVersion": {
+      "Type": "String",
+      "Description": "INCREMENT THIS BY 1 EVERY TIME YOU CHANGE index.html OR ANY APPLICATION CONTENT. Changing this value forces the full pipeline to re-run: Lambda re-uploads app.zip to S3, CodeBuild rebuilds the Docker image, ECR gets the new image, and ECS force-deploys the new container. Without changing this, CloudFormation will skip all downstream steps even if you edited the Lambda code."
+    }
+  },
+  "Resources": {
+    "SourceBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${AppName}-source-${AWS::AccountId}-${AWS::Region}"
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-source-bucket"
+            }
+          }
+        ]
+      }
+    },
+    "VPC": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.0.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-vpc"
+            }
+          }
+        ]
+      }
+    },
+    "InternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-igw"
+            }
+          }
+        ]
+      }
+    },
+    "IGWAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "InternetGatewayId": {
+          "Ref": "InternetGateway"
+        }
+      }
+    },
+    "PublicSubnet1": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "CidrBlock": "10.0.1.0/24",
+        "AvailabilityZone": {
+          "Fn::Select": [
+            0,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-subnet-az1"
+            }
+          }
+        ]
+      }
+    },
+    "PublicSubnet2": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "CidrBlock": "10.0.2.0/24",
+        "AvailabilityZone": {
+          "Fn::Select": [
+            1,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "MapPublicIpOnLaunch": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-subnet-az2"
+            }
+          }
+        ]
+      }
+    },
+    "PublicRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-rt"
+            }
+          }
+        ]
+      }
+    },
+    "PublicRoute": {
+      "Type": "AWS::EC2::Route",
+      "DependsOn": "IGWAttachment",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "InternetGateway"
+        }
+      }
+    },
+    "Subnet1RouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet1"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        }
+      }
+    },
+    "Subnet2RouteTableAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet2"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRouteTable"
+        }
+      }
+    },
+    "ALBSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Allow inbound HTTP to ALB from internet",
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-alb-sg"
+            }
+          }
+        ]
+      }
+    },
+    "ECSSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Allow HTTP from ALB to ECS Fargate tasks only",
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "SourceSecurityGroupId": {
+              "Ref": "ALBSecurityGroup"
+            }
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "FromPort": -1,
+            "ToPort": -1,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-ecs-sg"
+            }
+          }
+        ]
+      }
+    },
+    "ECRRepository": {
+      "Type": "AWS::ECR::Repository",
+      "Properties": {
+        "RepositoryName": {
+          "Fn::Sub": "${AppName}-repo"
+        },
+        "ImageScanningConfiguration": {
+          "ScanOnPush": true
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-repo"
+            }
+          }
+        ]
+      }
+    },
+    "SetupLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "SetupPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "CreateSLR",
+                  "Effect": "Allow",
+                  "Action": "iam:CreateServiceLinkedRole",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "GetRoleForExistenceCheck",
+                  "Effect": "Allow",
+                  "Action": "iam:GetRole",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "Logs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "EnsureServiceLinkedRolesLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AppName}-ensure-slr"
+        },
+        "Runtime": "python3.9",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "SetupLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 60,
+        "Code": {
+          "ZipFile": "import boto3\nimport cfnresponse\nimport time\n\nSLR_MAP = {\n    'ecs.amazonaws.com': 'AWSServiceRoleForECS',\n    'elasticloadbalancing.amazonaws.com': 'AWSServiceRoleForElasticLoadBalancing'\n}\n\ndef handler(event, context):\n    iam = boto3.client('iam')\n    try:\n        if event['RequestType'] == 'Delete':\n            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n            return\n\n        created_any = False\n        for svc, role_name in SLR_MAP.items():\n            try:\n                iam.get_role(RoleName=role_name)\n                print('SLR already exists for ' + svc)\n            except iam.exceptions.NoSuchEntityException:\n                iam.create_service_linked_role(AWSServiceName=svc)\n                print('Created SLR for ' + svc)\n                created_any = True\n            except Exception as e:\n                print('Retrying after error:', str(e))\n                time.sleep(5)\n                iam.get_role(RoleName=role_name)\n\n        if created_any:\n            print('Waiting 30 seconds for IAM propagation...')\n            time.sleep(30)\n\n        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n\n    except Exception as e:\n        print('Error:', str(e))\n        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})\n"
+        }
+      }
+    },
+    "EnsureServiceLinkedRoles": {
+      "Type": "Custom::EnsureServiceLinkedRoles",
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "EnsureServiceLinkedRolesLambda",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "UploadLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "UploadToS3Policy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "S3Write",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject",
+                    "s3:DeleteObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${AppName}-source-${AWS::AccountId}-${AWS::Region}/*"
+                  }
+                },
+                {
+                  "Sid": "Logs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CodeBuildRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "codebuild.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CodeBuildPermissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ECRAuth",
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "ECRPush",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:PutImage",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:UploadLayerPart",
+                    "ecr:CompleteLayerUpload"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "ECRRepository",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Sid": "S3Read",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:GetObjectVersion"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${AppName}-source-${AWS::AccountId}-${AWS::Region}/*"
+                  }
+                },
+                {
+                  "Sid": "CloudWatchLogs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ECSTaskExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        ]
+      }
+    },
+    "BuildLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "BuildLambdaPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "CodeBuildControl",
+                  "Effect": "Allow",
+                  "Action": [
+                    "codebuild:StartBuild",
+                    "codebuild:BatchGetBuilds"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "CodeBuildProject",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Sid": "Logs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ForceDeployLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ForceDeployPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ECSUpdateService",
+                  "Effect": "Allow",
+                  "Action": "ecs:UpdateService",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${AppName}-cluster/${AppName}-service"
+                  }
+                },
+                {
+                  "Sid": "ECSDescribeServices",
+                  "Effect": "Allow",
+                  "Action": "ecs:DescribeServices",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${AppName}-cluster/${AppName}-service"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${AppName}-cluster"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "Logs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "UploadFilesLambda": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "SourceBucket",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AppName}-upload-files"
+        },
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "UploadLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 60,
+        "Code": {
+          "ZipFile": "import boto3\nimport cfnresponse\nimport io\nimport zipfile\n\n# Using ECR Public Gallery instead of Docker Hub to avoid\n# anonymous pull rate limits (100/6h per IP) on shared CodeBuild NAT IPs.\nDOCKERFILE = (\n    \"FROM public.ecr.aws/nginx/nginx:1.29\\n\"\n    \"RUN rm -rf /usr/share/nginx/html/*\\n\"\n    \"COPY index.html /usr/share/nginx/html/index.html\\n\"\n    \"RUN chmod 644 /usr/share/nginx/html/index.html\\n\"\n    \"EXPOSE 80\\n\"\n    'CMD [\"nginx\", \"-g\", \"daemon off;\"]\\n'\n)\n\nINDEX_HTML = (\n    \"<!DOCTYPE html>\\n\"\n    \"<html lang='en'>\\n\"\n    \"<head>\\n\"\n    \"  <meta charset='UTF-8'/>\\n\"\n    \"  <meta name='viewport' content='width=device-width,initial-scale=1.0'/>\\n\"\n    \"  <title>NGINX on ECS Fargate</title>\\n\"\n    \"  <style>\\n\"\n    \"    *{margin:0;padding:0;box-sizing:border-box}\\n\"\n    \"    body{min-height:100vh;display:flex;align-items:center;justify-content:center;\"\n    \"background:#0f1117;font-family:'Courier New',monospace;color:#e2e8f0}\\n\"\n    \"    .grid-bg{position:fixed;inset:0;\"\n    \"background-image:linear-gradient(rgba(0,200,120,.04) 1px,transparent 1px),\"\n    \"linear-gradient(90deg,rgba(0,200,120,.04) 1px,transparent 1px);\"\n    \"background-size:40px 40px;pointer-events:none}\\n\"\n    \"    .card{position:relative;background:#161b27;border:1px solid rgba(0,200,120,.25);\"\n    \"border-radius:12px;padding:56px 64px;max-width:620px;width:90%;\"\n    \"text-align:center;box-shadow:0 0 60px rgba(0,200,120,.08)}\\n\"\n    \"    .badge{display:inline-block;background:rgba(0,200,120,.1);\"\n    \"border:1px solid rgba(0,200,120,.35);color:#00c878;font-size:11px;\"\n    \"letter-spacing:2.5px;text-transform:uppercase;padding:5px 14px;\"\n    \"border-radius:20px;margin-bottom:28px}\\n\"\n    \"    h1{font-size:2rem;font-weight:700;color:#f0f4f8;margin-bottom:12px}\\n\"\n    \"    h1 span{color:#00c878}\\n\"\n    \"    .subtitle{font-size:.9rem;color:#6b7a99;margin-bottom:40px}\\n\"\n    \"    .stack{display:flex;flex-direction:column;gap:10px;margin-bottom:40px;text-align:left}\\n\"\n    \"    .stack-item{display:flex;align-items:center;gap:12px;background:#1a2035;\"\n    \"border:1px solid rgba(255,255,255,.05);border-radius:8px;padding:12px 16px;font-size:.82rem}\\n\"\n    \"    .dot{width:8px;height:8px;border-radius:50%;background:#00c878;\"\n    \"flex-shrink:0;box-shadow:0 0 6px #00c878}\\n\"\n    \"    .label{color:#6b7a99;min-width:110px}\\n\"\n    \"    .value{color:#a8c5da}\\n\"\n    \"    .status{display:flex;align-items:center;justify-content:center;\"\n    \"gap:8px;font-size:.8rem;color:#00c878}\\n\"\n    \"    .pulse{width:8px;height:8px;border-radius:50%;background:#00c878;\"\n    \"animation:pulse 2s infinite}\\n\"\n    \"    @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.4)}}\\n\"\n    \"  </style>\\n\"\n    \"</head>\\n\"\n    \"<body>\\n\"\n    \"  <div class='grid-bg'></div>\\n\"\n    \"  <div class='card'>\\n\"\n    \"    <div class='badge'>Deployment Successful</div>\\n\"\n    \"    <h1>Running on <span>AWS ECS</span></h1>\\n\"\n    \"    <p class='subtitle'>NGINX container served via Fargate and Application Load Balancer</p>\\n\"\n    \"    <div class='stack'>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>Container</span><span class='value'>NGINX stable-alpine (ECR Public)</span></div>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>Registry</span><span class='value'>Amazon ECR Private</span></div>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>Build</span><span class='value'>AWS CodeBuild</span></div>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>Runtime</span><span class='value'>AWS Fargate Serverless</span></div>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>Network</span><span class='value'>ALB to ECS Port 80</span></div>\\n\"\n    \"      <div class='stack-item'><div class='dot'></div><span class='label'>IaC</span><span class='value'>AWS CloudFormation</span></div>\\n\"\n    \"    </div>\\n\"\n    \"    <div class='status'><div class='pulse'></div>Service is healthy and running</div>\\n\"\n    \"  </div>\\n\"\n    \"</body>\\n\"\n    \"</html>\\n\"\n)\n\ndef handler(event, context):\n    try:\n        bucket = event['ResourceProperties']['BucketName']\n        key = event['ResourceProperties']['ZipKey']\n        if event['RequestType'] in ('Create', 'Update'):\n            buf = io.BytesIO()\n            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:\n                zf.writestr('Dockerfile', DOCKERFILE)\n                zf.writestr('index.html', INDEX_HTML)\n            buf.seek(0)\n            boto3.client('s3').put_object(\n                Bucket=bucket, Key=key,\n                Body=buf.read(), ContentType='application/zip'\n            )\n            print('Uploaded ' + key + ' to ' + bucket)\n        elif event['RequestType'] == 'Delete':\n            try:\n                boto3.client('s3').delete_object(Bucket=bucket, Key=key)\n            except Exception:\n                pass\n        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n    except Exception as e:\n        print('Error ' + str(e))\n        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})\n"
+        }
+      }
+    },
+    "UploadFilesToS3": {
+      "Type": "Custom::UploadFilesToS3",
+      "DependsOn": "SourceBucket",
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "UploadFilesLambda",
+            "Arn"
+          ]
+        },
+        "BucketName": {
+          "Ref": "SourceBucket"
+        },
+        "ZipKey": "app.zip",
+        "Version": {
+          "Ref": "DeployVersion"
+        }
+      }
+    },
+    "CodeBuildProject": {
+      "Type": "AWS::CodeBuild::Project",
+      "DependsOn": [
+        "UploadFilesToS3",
+        "ECRRepository"
+      ],
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AppName}-build"
+        },
+        "Description": "Build NGINX Docker image from S3 and push to ECR",
+        "ServiceRole": {
+          "Fn::GetAtt": [
+            "CodeBuildRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Type": "LINUX_CONTAINER",
+          "Image": "aws/codebuild/standard:7.0",
+          "ComputeType": "BUILD_GENERAL1_SMALL",
+          "PrivilegedMode": true,
+          "EnvironmentVariables": [
+            {
+              "Name": "AWS_DEFAULT_REGION",
+              "Value": {
+                "Ref": "AWS::Region"
+              }
+            },
+            {
+              "Name": "AWS_ACCOUNT_ID",
+              "Value": {
+                "Ref": "AWS::AccountId"
+              }
+            },
+            {
+              "Name": "ECR_REGISTRY",
+              "Value": {
+                "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+              }
+            },
+            {
+              "Name": "ECR_REPO_URI",
+              "Value": {
+                "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}-repo"
+              }
+            }
+          ]
+        },
+        "Source": {
+          "Type": "S3",
+          "Location": {
+            "Fn::Sub": "${SourceBucket}/app.zip"
+          },
+          "BuildSpec": "version: 0.2\nphases:\n  pre_build:\n    commands:\n      - echo Logging in to Amazon ECR\n      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY\n      - export VERSION_TAG=$(date +%Y%m%d%H%M%S)\n      - echo Version tag is $VERSION_TAG\n  build:\n    commands:\n      - echo Building Docker image\n      - docker build -t $ECR_REPO_URI:latest .\n      - docker tag $ECR_REPO_URI:latest $ECR_REPO_URI:$VERSION_TAG\n  post_build:\n    commands:\n      - echo Pushing image to ECR\n      - docker push $ECR_REPO_URI:latest\n      - docker push $ECR_REPO_URI:$VERSION_TAG\n      - echo Build complete\n"
+        },
+        "Artifacts": {
+          "Type": "NO_ARTIFACTS"
+        },
+        "LogsConfig": {
+          "CloudWatchLogs": {
+            "Status": "ENABLED",
+            "GroupName": {
+              "Fn::Sub": "/codebuild/${AppName}"
+            }
+          }
+        }
+      }
+    },
+    "WaitForBuildLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AppName}-wait-for-build"
+        },
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "BuildLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 900,
+        "Code": {
+          "ZipFile": "import boto3\nimport cfnresponse\nimport time\n\ndef handler(event, context):\n    cb = boto3.client('codebuild')\n    try:\n        if event['RequestType'] == 'Delete':\n            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n            return\n\n        project  = event['ResourceProperties']['ProjectName']\n        response = cb.start_build(projectName=project)\n        build_id = response['build']['id']\n        print('Started build: ' + build_id)\n\n        while True:\n            remaining_ms = context.get_remaining_time_in_millis()\n            if remaining_ms < 60_000:\n                msg = ('Lambda is about to timeout. Build ' + build_id +\n                       ' may still be running. Check CodeBuild logs.')\n                print(msg)\n                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': msg})\n                return\n\n            time.sleep(15)\n            detail = cb.batch_get_builds(ids=[build_id])['builds'][0]\n            status = detail['buildStatus']\n            phase  = detail.get('currentPhase', 'UNKNOWN')\n            print('Status: ' + status + ' | Phase: ' + phase +\n                  ' | Remaining ms: ' + str(remaining_ms))\n\n            if status == 'SUCCEEDED':\n                print('Build SUCCEEDED. Image is in ECR.')\n                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'BuildId': build_id})\n                return\n\n            if status in ('FAILED', 'FAULT', 'TIMED_OUT', 'STOPPED'):\n                msg = 'Build ended with status ' + status + '. Check CodeBuild logs.'\n                print(msg)\n                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': msg})\n                return\n\n    except Exception as e:\n        print('Unhandled exception: ' + str(e))\n        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})\n"
+        }
+      }
+    },
+    "WaitForBuild": {
+      "Type": "Custom::WaitForBuild",
+      "DependsOn": [
+        "CodeBuildProject",
+        "UploadFilesToS3"
+      ],
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "WaitForBuildLambda",
+            "Arn"
+          ]
+        },
+        "ProjectName": {
+          "Ref": "CodeBuildProject"
+        },
+        "Version": {
+          "Ref": "DeployVersion"
+        }
+      }
+    },
+    "ForceDeployLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AppName}-force-deploy"
+        },
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "ForceDeployLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 60,
+        "Code": {
+          "ZipFile": "import boto3\nimport cfnresponse\n\ndef handler(event, context):\n    try:\n        if event['RequestType'] == 'Delete':\n            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n            return\n\n        cluster = event['ResourceProperties']['ClusterName']\n        service = event['ResourceProperties']['ServiceName']\n\n        ecs = boto3.client('ecs')\n        ecs.update_service(\n            cluster=cluster,\n            service=service,\n            forceNewDeployment=True\n        )\n        print('Forced new deployment for service ' + service + ' in cluster ' + cluster)\n        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})\n    except Exception as e:\n        print('Error: ' + str(e))\n        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})\n"
+        }
+      }
+    },
+    "ECSLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/ecs/${AppName}"
+        },
+        "RetentionInDays": 7
+      }
+    },
+    "ECSCluster": {
+      "Type": "AWS::ECS::Cluster",
+      "DependsOn": "EnsureServiceLinkedRoles",
+      "Properties": {
+        "ClusterName": {
+          "Fn::Sub": "${AppName}-cluster"
+        },
+        "CapacityProviders": [
+          "FARGATE"
+        ],
+        "DefaultCapacityProviderStrategy": [
+          {
+            "CapacityProvider": "FARGATE",
+            "Weight": 1
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-cluster"
+            }
+          }
+        ]
+      }
+    },
+    "ECSTaskDefinition": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${AppName}-task"
+        },
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "Cpu": "256",
+        "Memory": "512",
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ECSTaskExecutionRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": {
+              "Fn::Sub": "${AppName}-container"
+            },
+            "Image": {
+              "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}-repo:latest"
+            },
+            "Essential": true,
+            "PortMappings": [
+              {
+                "ContainerPort": 80,
+                "Protocol": "tcp"
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Fn::Sub": "/ecs/${AppName}"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "ecs"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "ALB": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "DependsOn": [
+        "IGWAttachment",
+        "EnsureServiceLinkedRoles"
+      ],
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AppName}-alb"
+        },
+        "Scheme": "internet-facing",
+        "Type": "application",
+        "Subnets": [
+          {
+            "Ref": "PublicSubnet1"
+          },
+          {
+            "Ref": "PublicSubnet2"
+          }
+        ],
+        "SecurityGroups": [
+          {
+            "Ref": "ALBSecurityGroup"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-alb"
+            }
+          }
+        ]
+      }
+    },
+    "ALBTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AppName}-tg"
+        },
+        "Protocol": "HTTP",
+        "Port": 80,
+        "VpcId": {
+          "Ref": "VPC"
+        },
+        "TargetType": "ip",
+        "HealthCheckProtocol": "HTTP",
+        "HealthCheckPath": "/",
+        "HealthCheckIntervalSeconds": 15,
+        "HealthCheckTimeoutSeconds": 5,
+        "HealthyThresholdCount": 2,
+        "UnhealthyThresholdCount": 3,
+        "Matcher": {
+          "HttpCode": "200-399"
+        },
+        "TargetGroupAttributes": [
+          {
+            "Key": "deregistration_delay.timeout_seconds",
+            "Value": "10"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-tg"
+            }
+          }
+        ]
+      }
+    },
+    "ALBListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "ALB"
+        },
+        "Protocol": "HTTP",
+        "Port": 80,
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "ALBTargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "ECSService": {
+      "Type": "AWS::ECS::Service",
+      "DependsOn": [
+        "ALBListener",
+        "WaitForBuild"
+      ],
+      "Properties": {
+        "ServiceName": {
+          "Fn::Sub": "${AppName}-service"
+        },
+        "Cluster": {
+          "Ref": "ECSCluster"
+        },
+        "TaskDefinition": {
+          "Ref": "ECSTaskDefinition"
+        },
+        "DesiredCount": 1,
+        "LaunchType": "FARGATE",
+        "HealthCheckGracePeriodSeconds": 60,
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "ENABLED",
+            "Subnets": [
+              {
+                "Ref": "PublicSubnet1"
+              },
+              {
+                "Ref": "PublicSubnet2"
+              }
+            ],
+            "SecurityGroups": [
+              {
+                "Ref": "ECSSecurityGroup"
+              }
+            ]
+          }
+        },
+        "LoadBalancers": [
+          {
+            "ContainerName": {
+              "Fn::Sub": "${AppName}-container"
+            },
+            "ContainerPort": 80,
+            "TargetGroupArn": {
+              "Ref": "ALBTargetGroup"
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AppName}-service"
+            }
+          }
+        ]
+      }
+    },
+    "ForceECSDeployment": {
+      "Type": "Custom::ForceECSDeployment",
+      "DependsOn": [
+        "ECSService",
+        "WaitForBuild"
+      ],
+      "Properties": {
+        "ServiceToken": {
+          "Fn::GetAtt": [
+            "ForceDeployLambda",
+            "Arn"
+          ]
+        },
+        "ClusterName": {
+          "Fn::Sub": "${AppName}-cluster"
+        },
+        "ServiceName": {
+          "Fn::Sub": "${AppName}-service"
+        },
+        "Version": {
+          "Ref": "DeployVersion"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ApplicationURL": {
+      "Description": "Your NGINX app URL. Open this once the stack shows CREATE_COMPLETE.",
+      "Value": {
+        "Fn::Sub": "http://${ALB.DNSName}"
+      }
+    },
+    "SourceBucketName": {
+      "Description": "S3 bucket auto-created and populated with Dockerfile and index.html",
+      "Value": {
+        "Ref": "SourceBucket"
+      }
+    },
+    "ECRRepositoryURI": {
+      "Description": "ECR repository URI used by the ECS Task Definition",
+      "Value": {
+        "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}-repo"
+      }
+    },
+    "DeployVersionUsed": {
+      "Description": "The DeployVersion parameter value used in this deployment. Increment this by 1 to trigger a full redeploy.",
+      "Value": {
+        "Ref": "DeployVersion"
+      }
+    }
+  }
+}

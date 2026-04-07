@@ -1,0 +1,13 @@
+{
+  "parameters": {
+    "AppName": {
+      "value": "nginx-app"
+    },
+    "CheckAcknowledgement": {
+      "value": "TRUE"
+    },
+    "DeployVersion": {
+        "value": "1"
+    }
+  }
+}
