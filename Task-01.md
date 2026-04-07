@@ -44,7 +44,7 @@ Your login credentials are **unique to you** and are provided on the CloudLabs E
 
 ---
 
-<img src="./images/Screenshot 2026-04-07 090007.png">
+<img src="./Images/Screenshot 2026-04-07 090007.png">
 
 ---
 
