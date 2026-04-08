@@ -8,24 +8,28 @@
                 "Order": 1
             },
             {
-                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-01.md",
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/taskOverview.md",
                 "Order": 2
             },
             {
-                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-02.md",
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-01.md",
                 "Order": 3
             },
             {
-                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-03.md",
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-02.md",
                 "Order": 4
             },
             {
-                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-04.md",
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-03.md",
                 "Order": 5
             },
             {
-                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-05.md",
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-04.md",
                 "Order": 6
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Final-Project-SpektraSystems/refs/heads/main/Task-05.md",
+                "Order": 7
             }
         ]
     }

@@ -400,4 +400,4 @@ When the lab session is over, the CloudLabs platform automatically shuts down an
 
 ## Ready to Start?
 
-Head to **Task 1: Accessing Your AWS Lab Account** to log in using the credentials from your Lab Details Page.
+Head to **Task Overview** to know what are the tasks that you are going to perform hands-on.
