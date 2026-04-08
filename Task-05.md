@@ -113,7 +113,7 @@ Think of CloudWatch Logs like a diary that your application writes in — every 
 3. If you cannot find it, use the **search box** at the top of the page and type `/ecs/nginx-app`
 4. Click on **`/ecs/nginx-app`** to open it
 
-> ℹ️ **What is this log group?** This is the CloudWatch Log Group that was created by the CloudFormation stack specifically to collect all log output from your NGINX container. Every time the container prints something to the screen, it appears here.
+> **What is this log group?** This is the CloudWatch Log Group that was created by the CloudFormation stack specifically to collect all log output from your NGINX container. Every time the container prints something to the screen, it appears here.
 
 ---
 
@@ -163,7 +163,7 @@ Think of CloudWatch Logs like a diary that your application writes in — every 
 2. These are the requests you made to `/test`, `/about`, and `/admin` in Steps 3 and 4
 3. You should be able to see the exact path that was requested in each 404 entry
 
-> ℹ️ **Interesting observation:** You will also see many log entries from **the AWS Load Balancer** doing its health checks. These requests come from internal AWS IP addresses and always request the path `/`. Their user agent contains the text `ELB-HealthChecker/2.0`.
+>  **Interesting observation:** You will also see many log entries from **the AWS Load Balancer** doing its health checks. These requests come from internal AWS IP addresses and always request the path `/`. Their user agent contains the text `ELB-HealthChecker/2.0`.
 
 ---
 

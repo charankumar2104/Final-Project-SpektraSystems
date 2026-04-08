@@ -1,749 +1,607 @@
 # CloudFormation Stack — Internal Team Readiness Guide
 
 > **Document Type:** Internal Reference
-> **Stack Name:** `nginx-app` (configurable via `AppName` parameter)
-> **Purpose:** Fully automated ECS Fargate deployment of an NGINX container using S3, CodeBuild, and ECR — zero manual steps post-deployment.
-> **IAM Capability Required:** `CAPABILITY_IAM` only *(no CAPABILITY_NAMED_IAM — all role names are auto-generated)*
+> **Stack Name:** `nginx-app` (set by the `AppName` parameter)
+> **Purpose:** A fully self-contained ECS Fargate deployment of an NGINX web app — no manual steps needed after stack creation.
+> **IAM Capability Required:** `CAPABILITY_IAM` only — role names are auto-generated so `CAPABILITY_NAMED_IAM` is not needed.
+> **Last Updated:** April 2026 | Maintained by: Charan Kumar Asam
 
 ---
 
 ## Table of Contents
 
-1. [Stack Overview](#1-stack-overview)
-2. [Architecture Diagram (Text)](#2-architecture-diagram-text)
-3. [Resource Creation Flow](#3-resource-creation-flow)
-4. [Component Reference](#4-component-reference)
-   - [Networking](#41-networking-resources)
-   - [Storage](#42-storage-resources)
-   - [IAM](#43-iam-roles)
-   - [Container Registry](#44-container-registry)
-   - [Automation — Lambda Functions](#45-automation--lambda-functions)
-   - [Automation — Custom Resources](#46-automation--custom-resources)
-   - [Build Pipeline](#47-build-pipeline)
-   - [Load Balancer](#48-load-balancer)
+1. [What This Stack Does](#1-what-this-stack-does)
+2. [Architecture at a Glance](#2-architecture-at-a-glance)
+3. [How Resources Are Created (Step by Step)](#3-how-resources-are-created-step-by-step)
+4. [Every Resource Explained](#4-every-resource-explained)
+   - [Networking](#41-networking)
+   - [Storage](#42-storage)
+   - [IAM Roles](#43-iam-roles)
+   - [Container Registry](#44-container-registry-ecr)
+   - [Lambda Functions](#45-lambda-functions)
+   - [CloudFormation Custom Resources](#46-cloudformation-custom-resources)
+   - [Build Pipeline](#47-build-pipeline-codebuild)
+   - [Load Balancer](#48-load-balancer-alb)
    - [ECS Compute](#49-ecs-compute)
-   - [Observability](#410-observability)
-5. [Inter-Service Dependency Map](#5-inter-service-dependency-map)
+   - [Logging](#410-logging-cloudwatch)
+5. [How Everything Depends on Each Other](#5-how-everything-depends-on-each-other)
 6. [Parameters](#6-parameters)
 7. [Outputs](#7-outputs)
-8. [IAM Permission Summary](#8-iam-permission-summary)
-9. [Failure Points & Troubleshooting](#9-failure-points--troubleshooting)
-10. [Known Design Decisions & Fixes](#10-known-design-decisions--fixes)
-11. [Re-Deployment Checklist](#11-re-deployment-checklist)
+8. [IAM Permissions Summary](#8-iam-permissions-summary)
+9. [What Can Go Wrong and How to Fix It](#9-what-can-go-wrong-and-how-to-fix-it)
+10. [Design Decisions Worth Knowing](#10-design-decisions-worth-knowing)
+11. [Checklist Before Deploying](#11-checklist-before-deploying)
 
 ---
 
-## 1. Stack Overview
+## 1. What This Stack Does
 
-This stack provisions a **complete, production-ready containerized web application** on AWS using CloudFormation. When the stack reaches `CREATE_COMPLETE`, the NGINX application is already live and accessible via an ALB DNS URL.
+When you deploy this stack, CloudFormation builds a complete containerized web application from scratch — automatically and in the right order. By the time the stack reaches `CREATE_COMPLETE`, the NGINX web page is already live and reachable at a public URL.
 
-### What the stack builds automatically
+Here's the short version of what happens under the hood:
 
-| Stage | What Happens |
+| Stage | What Actually Happens |
 |---|---|
-| **Pre-flight** | IAM service-linked roles for ECS and ELB are verified/created; stack waits 30 seconds for IAM propagation before continuing |
-| **Bootstrap** | S3 bucket created; Lambda uploads `Dockerfile` + `index.html` as `app.zip` |
-| **Build** | CodeBuild pulls `app.zip` from S3, builds a Docker image, pushes it to ECR |
-| **Wait** | A Lambda polls CodeBuild every 15 seconds; CloudFormation waits for it to confirm success |
-| **Serve** | ECS Fargate pulls the ECR image; ALB routes HTTP traffic to the container |
-| **Force Deploy** | A final Lambda triggers a `ForceNewDeployment` on the ECS service to guarantee the latest image is running |
+| **Prep** | Lambda generates a `Dockerfile` and `index.html`, zips them, and uploads the ZIP to S3 |
+| **Build** | CodeBuild downloads the ZIP, builds a Docker image, and pushes it to ECR |
+| **Wait** | A second Lambda polls CodeBuild every 15 seconds; CloudFormation doesn't move forward until the build succeeds |
+| **Deploy** | ECS Fargate pulls the image from ECR; the ALB starts routing traffic to the container |
+| **Confirm** | A third Lambda forces a fresh ECS deployment to make sure the latest image is actually running |
 
-> ⚠️ **ECS Service will not start until the CodeBuild build is confirmed SUCCEEDED.** This is enforced via a `DependsOn: WaitForBuild` on the ECS Service resource.
-
-> ⚠️ **ECS Cluster and ALB will not be created until service-linked IAM roles are confirmed present.** This is enforced via a `DependsOn: EnsureServiceLinkedRoles` on both the `ECSCluster` and `ALB` resources.
+One important thing to understand: **the ECS service will never start before the Docker image exists in ECR.** This is enforced by having the ECS service declare a dependency on the `WaitForBuild` custom resource. If the build fails, CloudFormation rolls everything back.
 
 ---
 
-## 2. Architecture Diagram (Text)
+## 2. Architecture at a Glance
 
 ```
-Internet
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│                        VPC (10.0.0.0/16)                │
-│                                                         │
-│   Internet Gateway ──► Public Route Table               │
-│                                                         │
-│   ┌─────────────┐       ┌─────────────┐                 │
-│   │  Subnet AZ1 │       │  Subnet AZ2 │                 │
-│   │ 10.0.1.0/24 │       │ 10.0.2.0/24 │                 │
-│   └──────┬──────┘       └──────┬──────┘                 │
-│          └────────┬────────────┘                        │
-│                   ▼                                     │
-│         ┌──────────────────┐                            │
-│         │  ALB (Port 80)   │◄── ALB Security Group      │
-│         └────────┬─────────┘     (0.0.0.0/0:80)         │
-│                  │                                      │
-│                  ▼                                      │
-│         ┌──────────────────┐                            │
-│         │  Target Group    │                            │
-│         │ (Health: 200-399)│                            │
-│         └────────┬─────────┘                            │
-│                  │                                      │
-│                  ▼                                      │
-│         ┌──────────────────┐                            │
-│         │  ECS Fargate Task│◄── ECS Security Group      │
-│         │  NGINX 1.29      │    (ALB SG → Port 80 only) │
-│         │  (ECR Public)    │                            │
-│         └──────────────────┘                            │
-│                  ▲                                      │
-│                  │ pulls image                          │
-│         ┌────────┴─────────┐                            │
-│         │   ECR Repository  │                           │
-│         └──────────────────┘                            │
-│                  ▲                                      │
-│                  │ docker push                          │
-│         ┌────────┴─────────┐                            │
-│         │   CodeBuild      │◄── S3 bucket (app.zip)     │
-│         └──────────────────┘                            │
-└─────────────────────────────────────────────────────────┘
+Visitor's browser
+       │
+       ▼  HTTP port 80
+┌──────────────────────────────────────────────────────────┐
+│                    VPC (10.0.0.0/16)                     │
+│                                                          │
+│  Internet Gateway ──► Public Route Table                 │
+│                                                          │
+│  ┌──────────────┐       ┌──────────────┐                 │
+│  │ Subnet AZ1   │       │ Subnet AZ2   │                 │
+│  │ 10.0.1.0/24  │       │ 10.0.2.0/24  │                 │
+│  └──────┬───────┘       └──────┬───────┘                 │
+│         └──────────┬───────────┘                         │
+│                    ▼                                     │
+│         ┌─────────────────────┐                          │
+│         │  ALB  (port 80)     │ ◄── ALB Security Group   │
+│         │  internet-facing    │     (0.0.0.0/0 → 80)     │
+│         └──────────┬──────────┘                          │
+│                    │                                     │
+│                    ▼                                     │
+│         ┌─────────────────────┐                          │
+│         │  Target Group       │                          │
+│         │  health: GET /      │                          │
+│         │  matcher: 200-399   │                          │
+│         └──────────┬──────────┘                          │
+│                    │                                     │
+│                    ▼                                     │
+│         ┌─────────────────────┐                          │
+│         │  ECS Fargate Task   │ ◄── ECS Security Group   │
+│         │  NGINX 1.29 (ECR)   │     (ALB SG → port 80)   │
+│         └──────────┬──────────┘                          │
+│                    │ logs                                │
+│                    ▼                                     │
+│         CloudWatch /ecs/nginx-app                        │
+│                    ▲                                     │
+│                    │ pulls image                         │
+│         ┌──────────┴──────────┐                          │
+│         │   ECR Repository    │                          │
+│         │   nginx-app-repo    │                          │
+│         └──────────┬──────────┘                          │
+│                    ▲                                     │
+│                    │ docker push                         │
+│         ┌──────────┴──────────┐                          │
+│         │  CodeBuild          │ ◄── S3 (app.zip)         │
+│         │  nginx-app-build    │                          │
+│         └─────────────────────┘                          │
+└──────────────────────────────────────────────────────────┘
 
-CloudFormation Orchestration Layer
-────────────────────────────────────────────────────────────
-EnsureServiceLinkedRolesLambda ──► IAM (create ECS + ELB SLRs)
-UploadFilesLambda              ──► S3 (app.zip)
-WaitForBuildLambda             ──► CodeBuild (start + poll)
-ForceDeployLambda              ──► ECS (ForceNewDeployment)
-CloudFormation     ──► Waits on Custom Resources before ECS
+CloudFormation automation layer:
+  EnsureServiceLinkedRolesLambda  ──► IAM (creates ECS + ELB SLRs)
+  UploadFilesLambda               ──► S3 (generates + uploads app.zip)
+  WaitForBuildLambda              ──► CodeBuild (starts build + polls)
+  ForceDeployLambda               ──► ECS (forces fresh deployment)
 ```
 
 ---
 
-## 3. Resource Creation Flow
+## 3. How Resources Are Created (Step by Step)
 
-CloudFormation creates resources in dependency order. Below is the exact sequential flow with logical IDs.
+CloudFormation doesn't create everything at once — it follows dependencies. Here's the exact order, organized by phase:
 
 ```
-PHASE 1 — Foundation (no dependencies)
-─────────────────────────────────────────────────────────────
-SourceBucket         → S3 bucket for source artifacts (versioning enabled)
-VPC                  → Network boundary
-InternetGateway      → Internet access gateway
-ECRRepository        → Private Docker image registry (scan-on-push enabled)
-ECSLogGroup          → CloudWatch log group for ECS tasks
-SetupLambdaRole      → IAM role for EnsureServiceLinkedRoles Lambda
-UploadLambdaRole     → IAM role for upload Lambda
-CodeBuildRole        → IAM role for CodeBuild
-ECSTaskExecutionRole → IAM role for ECS task
-BuildLambdaRole      → IAM role for wait Lambda
-ForceDeployLambdaRole → IAM role for force deploy Lambda
+PHASE 1 — Foundation (created first, no dependencies)
+──────────────────────────────────────────────────────────────
+SourceBucket          S3 bucket to hold app.zip
+VPC                   Private network
+InternetGateway       Gateway connecting VPC to the internet
+ECRRepository         Private Docker image registry
+ECSLogGroup           CloudWatch log group for container logs
+SetupLambdaRole       IAM role for the Ensure SLR Lambda
+UploadLambdaRole      IAM role for the Upload Files Lambda
+CodeBuildRole         IAM role for CodeBuild
+ECSTaskExecutionRole  IAM role for ECS tasks
+BuildLambdaRole       IAM role for the Wait For Build Lambda
+ForceDeployLambdaRole IAM role for the Force Deploy Lambda
 
-         │
-         ▼
+          │
+          ▼
 
 PHASE 2 — Network Wiring
-─────────────────────────────────────────────────────────────
-IGWAttachment              → Attaches IGW to VPC
-PublicSubnet1 / Subnet2    → Two AZ subnets inside VPC
-ALBSecurityGroup           → SG for ALB
-ECSSecurityGroup           → SG for ECS (source: ALB SG)
-PublicRouteTable           → Route table for subnets
-PublicRoute          (DependsOn: IGWAttachment)
+──────────────────────────────────────────────────────────────
+IGWAttachment              Attaches the Internet Gateway to the VPC
+PublicSubnet1              Subnet in first Availability Zone
+PublicSubnet2              Subnet in second Availability Zone
+ALBSecurityGroup           Firewall for the ALB
+ECSSecurityGroup           Firewall for ECS tasks (only ALB can reach in)
+PublicRouteTable           Route table for internet traffic
+PublicRoute                Default route: all traffic → Internet Gateway
 Subnet1RouteTableAssociation
 Subnet2RouteTableAssociation
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 3 — Lambda Functions
-─────────────────────────────────────────────────────────────
-EnsureServiceLinkedRolesLambda → Uses SetupLambdaRole
-UploadFilesLambda    → Uses UploadLambdaRole, DependsOn: SourceBucket
-WaitForBuildLambda   → Uses BuildLambdaRole
-ForceDeployLambda    → Uses ForceDeployLambdaRole
+PHASE 3 — Lambda Functions Created
+──────────────────────────────────────────────────────────────
+EnsureServiceLinkedRolesLambda   Uses SetupLambdaRole
+UploadFilesLambda                Uses UploadLambdaRole, DependsOn: SourceBucket
+WaitForBuildLambda               Uses BuildLambdaRole
+ForceDeployLambda                Uses ForceDeployLambdaRole
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 4 — Pre-flight (Custom Resource ensures IAM SLRs exist)
-─────────────────────────────────────────────────────────────
-EnsureServiceLinkedRoles  → Custom Resource → calls EnsureServiceLinkedRolesLambda
-                            → Checks for ECS and ELB service-linked roles
-                            → Creates them if missing
-                            → Waits 30 seconds for IAM propagation
-                            → ECSCluster and ALB DependsOn this resource
+PHASE 4 — Service Linked Roles Confirmed
+──────────────────────────────────────────────────────────────
+EnsureServiceLinkedRoles (Custom Resource)
+  → Calls EnsureServiceLinkedRolesLambda
+  → Lambda checks if ECS and ELB service-linked IAM roles exist
+  → Creates them if missing
+  → Waits 30 seconds for IAM propagation
+  → CloudFormation waits here before creating the ALB and ECS cluster
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 5 — Bootstrap (Custom Resource triggers upload Lambda)
-─────────────────────────────────────────────────────────────
-UploadFilesToS3      → Custom Resource → calls UploadFilesLambda
-                       → Lambda creates app.zip and puts it in S3
+PHASE 5 — Source Files Uploaded
+──────────────────────────────────────────────────────────────
+UploadFilesToS3 (Custom Resource)
+  → Calls UploadFilesLambda
+  → Lambda generates Dockerfile + index.html in memory
+  → Packages them as app.zip
+  → Uploads app.zip to S3
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 6 — Build Project
-─────────────────────────────────────────────────────────────
-CodeBuildProject     → DependsOn: UploadFilesToS3
-                       → Source: S3 bucket / app.zip
-                       → Pushes image to ECR with :latest and :YYYYMMDDHHMMSS tags
+PHASE 6 — Build Project Created
+──────────────────────────────────────────────────────────────
+CodeBuildProject
+  → DependsOn: UploadFilesToS3
+  → Configured to read from S3 (app.zip) and push to ECR
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 7 — Build Execution (Custom Resource waits for build)
-─────────────────────────────────────────────────────────────
-WaitForBuild         → Custom Resource → calls WaitForBuildLambda
-                       → Lambda starts CodeBuild build
-                       → Polls every 15s until SUCCEEDED / FAILED
-                       → CloudFormation blocked here until build finishes
+PHASE 7 — Image Built and Confirmed in ECR
+──────────────────────────────────────────────────────────────
+WaitForBuild (Custom Resource)
+  → DependsOn: CodeBuildProject, UploadFilesToS3
+  → Calls WaitForBuildLambda
+  → Lambda starts the CodeBuild build
+  → Polls every 15 seconds until SUCCEEDED or FAILED
+  → CloudFormation is completely blocked here until the Lambda reports back
+  → If build fails → CloudFormation rolls back the stack
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 8 — Load Balancer
-─────────────────────────────────────────────────────────────
-ALB                  → DependsOn: IGWAttachment + EnsureServiceLinkedRoles
-ALBTargetGroup       → Depends on VPC
-ALBListener          → Connects ALB → TargetGroup
+PHASE 8 — Serving Layer Created
+──────────────────────────────────────────────────────────────
+ALB                   DependsOn: IGWAttachment, EnsureServiceLinkedRoles
+ALBTargetGroup        Targets: ECS task IPs; health check: GET / → 200-399
+ALBListener           Forwards port 80 traffic to ALBTargetGroup
+ECSCluster            DependsOn: EnsureServiceLinkedRoles; Fargate capacity provider
+ECSTaskDefinition     Image: ECR :latest; CPU 256; Memory 512 MB
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 9 — ECS (only after build confirmed + ALB ready)
-─────────────────────────────────────────────────────────────
-ECSCluster           → DependsOn: EnsureServiceLinkedRoles
-                       → Fargate cluster with FARGATE capacity provider
-ECSTaskDefinition    → Task with ECR image reference
-ECSService           → DependsOn: ALBListener + WaitForBuild
-                       → Pulls image from ECR
-                       → Registers in ALBTargetGroup
+PHASE 9 — ECS Service Started
+──────────────────────────────────────────────────────────────
+ECSService
+  → DependsOn: ALBListener, WaitForBuild
+  → Pulls :latest image from ECR
+  → Registers container IP in ALBTargetGroup
+  → ALB health checks begin (60-second grace period)
+  → Application goes live
 
-         │
-         ▼
+          │
+          ▼
 
-PHASE 10 — Post-Deploy Force Redeploy
-─────────────────────────────────────────────────────────────
-ForceECSDeployment   → Custom Resource → calls ForceDeployLambda
-                       → DependsOn: ECSService + WaitForBuild
-                       → Issues ForceNewDeployment to ECS service
-                       → Ensures the latest ECR image is pulled every time
-                         DeployVersion is incremented
+PHASE 10 — Fresh Deployment Forced
+──────────────────────────────────────────────────────────────
+ForceECSDeployment (Custom Resource)
+  → DependsOn: ECSService, WaitForBuild
+  → Calls ForceDeployLambda
+  → Lambda calls ecs:UpdateService with forceNewDeployment=True
+  → Guarantees ECS is running the latest image, not a cached one
 
-         │
-         ▼
+          │
+          ▼
 
 STACK STATUS: CREATE_COMPLETE
-Application is live at ALB DNS URL
+Application is live at the ALB URL (see Outputs → ApplicationURL)
 ```
 
 ---
 
-## 4. Component Reference
+## 4. Every Resource Explained
 
-### 4.1 Networking Resources
+### 4.1 Networking
 
-#### `VPC`
-- **Type:** `AWS::EC2::VPC`
-- **CIDR:** `10.0.0.0/16`
-- **Purpose:** Isolated network boundary for all resources. DNS support and hostname resolution enabled — required for ECS tasks to resolve ECR endpoints.
+**VPC** (`AWS::EC2::VPC`)
+CIDR: `10.0.0.0/16`. The isolated network boundary for the entire stack. DNS support and DNS hostnames are both enabled — ECS tasks need DNS resolution to find ECR endpoints when pulling images.
 
----
+**Internet Gateway + IGW Attachment** (`AWS::EC2::InternetGateway` / `AWS::EC2::VPCGatewayAttachment`)
+The gateway that connects the VPC to the public internet. Nothing can reach the internet — inbound or outbound — without it. The attachment resource links the gateway to the VPC.
 
-#### `InternetGateway` + `IGWAttachment`
-- **Type:** `AWS::EC2::InternetGateway` / `AWS::EC2::VPCGatewayAttachment`
-- **Purpose:** Provides internet connectivity to the VPC. The `IGWAttachment` links the gateway to the VPC. The ALB and ECS tasks depend on this for inbound/outbound internet access.
+**Public Subnets** (`AWS::EC2::Subnet`)
+Two subnets, one in each Availability Zone: `10.0.1.0/24` (AZ 0) and `10.0.2.0/24` (AZ 1). Both have `MapPublicIpOnLaunch: true`, so ECS tasks get a public IP automatically — they need one to reach ECR for image pulls without a NAT gateway. The ALB requires at least two subnets in different AZs, so two subnets is the minimum.
 
----
+**Route Table + Route** (`AWS::EC2::RouteTable` / `AWS::EC2::Route`)
+Sends all outbound traffic (`0.0.0.0/0`) through the Internet Gateway. Both subnets are associated with this route table.
 
-#### `PublicSubnet1` / `PublicSubnet2`
-- **Type:** `AWS::EC2::Subnet`
-- **CIDRs:** `10.0.1.0/24` (AZ-0), `10.0.2.0/24` (AZ-1)
-- **Purpose:** Two subnets across different Availability Zones. Required by the ALB (which mandates at least 2 AZs). ECS tasks run in these subnets with public IPs assigned automatically (`MapPublicIpOnLaunch: true`).
+**ALB Security Group** (`AWS::EC2::SecurityGroup`)
+Inbound: TCP port 80 from anywhere (`0.0.0.0/0`). This is what lets the public internet reach the load balancer.
 
----
-
-#### `PublicRouteTable` + `PublicRoute`
-- **Type:** `AWS::EC2::RouteTable` / `AWS::EC2::Route`
-- **Purpose:** Routes all outbound traffic (`0.0.0.0/0`) through the Internet Gateway. Both subnets are associated with this route table via `Subnet1RouteTableAssociation` and `Subnet2RouteTableAssociation`.
+**ECS Security Group** (`AWS::EC2::SecurityGroup`)
+Inbound: TCP port 80 only from the ALB Security Group — not from the internet directly. Outbound: all traffic allowed (ECS tasks need outbound access to pull images from ECR and send logs to CloudWatch). This setup means containers are never directly reachable from the internet.
 
 ---
 
-#### `ALBSecurityGroup`
-- **Type:** `AWS::EC2::SecurityGroup`
-- **Inbound:** TCP port 80 from `0.0.0.0/0` (entire internet)
-- **Purpose:** Controls what traffic reaches the ALB. Only HTTP (port 80) is open from the internet.
+### 4.2 Storage
 
----
-
-#### `ECSSecurityGroup`
-- **Type:** `AWS::EC2::SecurityGroup`
-- **Inbound:** TCP port 80 **only from `ALBSecurityGroup`** (not from internet directly)
-- **Outbound:** All traffic allowed (needed for ECR pulls and CloudWatch logs)
-- **Purpose:** Locks down ECS tasks so only the ALB can send traffic to them. This is a security best practice — containers are never directly reachable from the internet.
-
----
-
-### 4.2 Storage Resources
-
-#### `SourceBucket`
-- **Type:** `AWS::S3::Bucket`
-- **Name:** `{AppName}-source-{AccountId}-{Region}` *(globally unique)*
-- **Versioning:** Enabled — every upload of `app.zip` is retained as a distinct version
-- **Purpose:** Stores `app.zip` which contains the `Dockerfile` and `index.html`. CodeBuild pulls from this bucket to build the Docker image. The bucket is created first — all other automation depends on it.
+**Source Bucket** (`AWS::S3::Bucket`)
+Name format: `{AppName}-source-{AccountId}-{Region}` — globally unique by design. Versioning is enabled so every upload of `app.zip` is preserved. This bucket is the starting point for the whole build pipeline — everything downstream depends on it existing first.
 
 ---
 
 ### 4.3 IAM Roles
 
-> All roles use **auto-generated names** (no `RoleName` property). This means only `CAPABILITY_IAM` is needed — not `CAPABILITY_NAMED_IAM`. This is intentional for compatibility with automated deployment platforms like CloudLabs.
+All roles use auto-generated names (no `RoleName` property in the template). This is intentional — it means the stack only needs `CAPABILITY_IAM` to deploy. If names were hardcoded, `CAPABILITY_NAMED_IAM` would be required, which some deployment platforms restrict.
 
-#### `SetupLambdaRole`
-- **Used By:** `EnsureServiceLinkedRolesLambda`
-- **Permissions:**
-  - `iam:CreateServiceLinkedRole` on `*` (required to create ECS and ELB service-linked roles)
-  - `iam:GetRole` on `*` (to check whether the roles already exist)
-  - `logs:*` on CloudWatch for Lambda logging
+**SetupLambdaRole**
+Used by: `EnsureServiceLinkedRolesLambda`
+Permissions: Create ECS and ELB service-linked roles (`iam:CreateServiceLinkedRole`); read existing IAM roles (`iam:GetRole`); write Lambda logs to CloudWatch.
 
-#### `UploadLambdaRole`
-- **Used By:** `UploadFilesLambda`
-- **Permissions:**
-  - `s3:PutObject`, `s3:DeleteObject` on the source bucket
-  - `logs:*` on CloudWatch for Lambda logging
+**UploadLambdaRole**
+Used by: `UploadFilesLambda`
+Permissions: Put and delete objects in the source S3 bucket only (`s3:PutObject`, `s3:DeleteObject`); write Lambda logs to CloudWatch.
 
-#### `CodeBuildRole`
-- **Used By:** `CodeBuildProject`
-- **Permissions:**
-  - `ecr:GetAuthorizationToken` (resource: `*` — AWS requirement; token API does not support resource-level scoping)
-  - ECR push actions (`BatchCheckLayerAvailability`, `PutImage`, `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`) scoped to the ECR repository ARN
-  - `s3:GetObject`, `s3:GetObjectVersion` on the source bucket
-  - `logs:*` for build logs
+**CodeBuildRole**
+Used by: `CodeBuildProject`
+Permissions: Get an ECR auth token (`ecr:GetAuthorizationToken` — this has to be `Resource: *` because AWS doesn't support resource-level scoping for this API call); push image layers to the ECR repository; read `app.zip` from the S3 bucket; write build logs to CloudWatch.
 
-#### `ECSTaskExecutionRole`
-- **Used By:** `ECSTaskDefinition`
-- **Permissions:** AWS Managed Policy `AmazonECSTaskExecutionRolePolicy`
-  - Allows ECS to pull images from ECR and send logs to CloudWatch on behalf of the task
+**ECSTaskExecutionRole**
+Used by: `ECSTaskDefinition`
+Permissions: AWS managed policy `AmazonECSTaskExecutionRolePolicy` — lets ECS pull images from ECR and send container output to CloudWatch on behalf of the task.
 
-#### `BuildLambdaRole`
-- **Used By:** `WaitForBuildLambda`
-- **Permissions:**
-  - `codebuild:StartBuild`, `codebuild:BatchGetBuilds` scoped to the `CodeBuildProject` ARN
-  - `logs:*` for Lambda logging
+**BuildLambdaRole**
+Used by: `WaitForBuildLambda`
+Permissions: Start a CodeBuild build and check its status (`codebuild:StartBuild`, `codebuild:BatchGetBuilds`) — scoped to the specific CodeBuild project ARN, not all projects; write Lambda logs to CloudWatch.
 
-#### `ForceDeployLambdaRole`
-- **Used By:** `ForceDeployLambda`
-- **Permissions:**
-  - `ecs:UpdateService` scoped to the specific ECS service ARN (`{AppName}-cluster/{AppName}-service`)
-  - `ecs:DescribeServices` scoped to both the ECS service ARN and cluster ARN
-  - `logs:*` for Lambda logging
+**ForceDeployLambdaRole**
+Used by: `ForceDeployLambda`
+Permissions: Update the ECS service (`ecs:UpdateService`) and describe the service and cluster (`ecs:DescribeServices`) — scoped to the specific ECS service and cluster ARNs; write Lambda logs to CloudWatch.
 
 ---
 
-### 4.4 Container Registry
+### 4.4 Container Registry (ECR)
 
-#### `ECRRepository`
-- **Type:** `AWS::ECR::Repository`
-- **Name:** `{AppName}-repo`
-- **Scan on Push:** Enabled (automatic vulnerability scanning on every new image)
-- **Purpose:** Private Docker image registry. CodeBuild pushes the built image here; ECS pulls from here when launching tasks. The image is tagged as both `:latest` and a timestamp tag (e.g., `:20240315120000`).
+**ECR Repository** (`AWS::ECR::Repository`)
+Name: `{AppName}-repo`. Scan on push is enabled, so every image is automatically scanned for known vulnerabilities when it's pushed. CodeBuild pushes two tags on every build:
+- `:latest` — always points to the most recent build
+- `:YYYYMMDDHHMMSS` — a permanent timestamp snapshot for rollback purposes
 
----
-
-### 4.5 Automation — Lambda Functions
-
-#### `EnsureServiceLinkedRolesLambda`
-- **Function Name:** `{AppName}-ensure-slr`
-- **Runtime:** Python 3.9
-- **Timeout:** 60 seconds
-- **Trigger:** CloudFormation Custom Resource (`EnsureServiceLinkedRoles`)
-- **What it does:**
-  - On `Create`/`Update`: Iterates over the required service-linked roles for `ecs.amazonaws.com` (`AWSServiceRoleForECS`) and `elasticloadbalancing.amazonaws.com` (`AWSServiceRoleForElasticLoadBalancing`). For each, attempts `iam:GetRole` — if the role does not exist, calls `iam:CreateServiceLinkedRole`. If any role was created, waits 30 seconds for IAM propagation before returning.
-  - On `Delete`: Immediately returns `SUCCESS` (service-linked roles are not deleted on stack teardown).
-- **Why it exists:** Brand-new AWS accounts do not have the ECS or ELB service-linked roles pre-created. Without them, creating an ECS cluster or an ALB fails. This Lambda ensures the roles are present before either resource is provisioned, making the stack deployable in any account regardless of its history.
+ECS always pulls `:latest` when starting a new task.
 
 ---
 
-#### `UploadFilesLambda`
-- **Function Name:** `{AppName}-upload-files`
-- **Runtime:** Python 3.12
-- **Timeout:** 60 seconds
-- **Trigger:** CloudFormation Custom Resource (`UploadFilesToS3`)
-- **What it does:**
-  - On `Create`/`Update`: Generates a ZIP file in memory containing a hardcoded `Dockerfile` and `index.html`, then uploads it to the S3 bucket as `app.zip`.
-  - On `Delete`: Removes `app.zip` from S3 (cleanup).
-- **Note on base image:** The `Dockerfile` uses `public.ecr.aws/nginx/nginx:1.29` (Amazon ECR Public Gallery) rather than Docker Hub. This avoids anonymous pull rate limits (100 pulls per 6 hours per IP) that frequently affect shared CodeBuild NAT IPs.
-- **Why it exists:** CloudFormation cannot natively write files to S3. This Lambda bridges that gap — making the stack truly self-contained with zero pre-requisites.
+### 4.5 Lambda Functions
+
+**EnsureServiceLinkedRolesLambda** (`{AppName}-ensure-slr`)
+Runtime: Python 3.9 | Timeout: 60 seconds
+
+Checks whether the `AWSServiceRoleForECS` and `AWSServiceRoleForElasticLoadBalancing` IAM service-linked roles exist in the account. If either is missing, it creates them. If both already exist, it skips creation. After any creation, it waits 30 seconds for IAM to propagate changes. This solves a real problem: brand-new AWS accounts don't have these roles yet, and trying to create an ECS cluster or ALB without them fails immediately.
+
+**UploadFilesLambda** (`{AppName}-upload-files`)
+Runtime: Python 3.12 | Timeout: 60 seconds
+
+On `Create` or `Update`: Builds the `Dockerfile` and `index.html` from hardcoded strings in the function code, packages them into a ZIP file in memory (never touches disk), and uploads the ZIP to S3 as `app.zip`. On `Delete`: Removes `app.zip` from S3. This function is why the stack is fully self-contained — there are no pre-existing files required anywhere.
+
+Note: The Dockerfile pulls the NGINX base image from the ECR Public Gallery (`public.ecr.aws/nginx/nginx:1.29`) instead of Docker Hub. This avoids Docker Hub's anonymous pull rate limits, which can cause builds to fail on shared CodeBuild infrastructure.
+
+**WaitForBuildLambda** (`{AppName}-wait-for-build`)
+Runtime: Python 3.12 | Timeout: 900 seconds (15 minutes — the maximum Lambda allows)
+
+On `Create` or `Update`: Calls `codebuild:StartBuild` to kick off a build, then enters a polling loop — every 15 seconds it checks the build status. When the build finishes, it reports `SUCCESS` or `FAILED` back to CloudFormation.
+
+Two safety details worth knowing:
+1. If the Lambda has less than 60 seconds of runtime left, it proactively sends `FAILED` to CloudFormation rather than letting Lambda time out uncleanly (which would leave CloudFormation waiting forever).
+2. On `Delete`, it immediately returns `SUCCESS` — there's nothing to clean up.
+
+**ForceDeployLambda** (`{AppName}-force-deploy`)
+Runtime: Python 3.12 | Timeout: 60 seconds
+
+Calls `ecs:UpdateService` with `forceNewDeployment=True` on the `{AppName}-service` in the `{AppName}-cluster`. This forces ECS to pull the latest image from ECR and restart the container, even if the task definition itself hasn't changed. Without this, ECS might continue running a previously cached container after a new build completes. On `Delete`, returns `SUCCESS` immediately.
 
 ---
 
-#### `WaitForBuildLambda`
-- **Function Name:** `{AppName}-wait-for-build`
-- **Runtime:** Python 3.12
-- **Timeout:** 900 seconds (15 minutes — maximum Lambda allows)
-- **Trigger:** CloudFormation Custom Resource (`WaitForBuild`)
-- **What it does:**
-  - On `Create`/`Update`: Calls `codebuild:StartBuild` to kick off a build, then polls `codebuild:BatchGetBuilds` every 15 seconds.
-  - Returns `SUCCESS` to CloudFormation when build status is `SUCCEEDED`.
-  - Returns `FAILED` if build status is `FAILED`, `FAULT`, `TIMED_OUT`, or `STOPPED`.
-  - Has a self-timeout guard: if Lambda has less than 60 seconds remaining, it sends `FAILED` to CloudFormation before Lambda itself times out.
-  - On `Delete`: Immediately returns `SUCCESS` (no cleanup needed).
-- **Why it exists:** CloudFormation has no native mechanism to wait for a CodeBuild job to complete. Without this, ECS would start before the Docker image exists in ECR and the service would fail to launch.
+### 4.6 CloudFormation Custom Resources
+
+Custom Resources are how CloudFormation calls Lambda functions during a deployment and waits for a result before continuing.
+
+**EnsureServiceLinkedRoles** (`Custom::EnsureServiceLinkedRoles`)
+Backed by `EnsureServiceLinkedRolesLambda`. This runs early in the deployment — before the ALB and ECS cluster are created — to make sure the required IAM roles exist.
+
+**UploadFilesToS3** (`Custom::UploadFilesToS3`)
+Backed by `UploadFilesLambda`. Properties passed: `BucketName`, `ZipKey` (`app.zip`), and `Version` (the `DeployVersion` parameter value). Including `Version` is what makes CloudFormation re-trigger this resource on updates — if `Version` didn't change, CloudFormation would assume nothing changed and skip the Lambda call entirely.
+
+**WaitForBuild** (`Custom::WaitForBuild`)
+Backed by `WaitForBuildLambda`. DependsOn: `CodeBuildProject` and `UploadFilesToS3`. Properties passed: `ProjectName` and `Version`. This is the synchronization point of the entire stack — everything downstream (ECS service, Force Deploy) waits for this to succeed.
+
+**ForceECSDeployment** (`Custom::ForceECSDeployment`)
+Backed by `ForceDeployLambda`. DependsOn: `ECSService` and `WaitForBuild`. Properties passed: `ClusterName`, `ServiceName`, and `Version`. The `Version` property here is also what triggers this resource to re-run when `DeployVersion` is incremented.
 
 ---
 
-#### `ForceDeployLambda`
-- **Function Name:** `{AppName}-force-deploy`
-- **Runtime:** Python 3.12
-- **Timeout:** 60 seconds
-- **Trigger:** CloudFormation Custom Resource (`ForceECSDeployment`)
-- **What it does:**
-  - On `Create`/`Update`: Calls `ecs:UpdateService` with `forceNewDeployment: true` on the ECS service. This causes ECS to pull the latest image from ECR and replace the running task, even if the task definition has not changed.
-  - On `Delete`: Immediately returns `SUCCESS` (no cleanup needed).
-- **Why it exists:** When `DeployVersion` is incremented and the stack is updated, the new Docker image is built and pushed to ECR but the `ECSTaskDefinition` resource does not change (it always references `:latest`). Without a forced redeploy, ECS would continue running the old container. This Lambda guarantees every update cycle ends with the newest image running.
+### 4.7 Build Pipeline (CodeBuild)
 
----
+**CodeBuildProject** (`AWS::CodeBuild::Project`)
+Name: `{AppName}-build`
+Environment: `LINUX_CONTAINER` / `standard:7.0` / `BUILD_GENERAL1_SMALL` / Privileged Mode ON (required for running Docker inside CodeBuild)
+Source: S3 — reads from `{SourceBucket}/app.zip`
 
-### 4.6 Automation — Custom Resources
+Build phases:
 
-#### `EnsureServiceLinkedRoles`
-- **Type:** `Custom::EnsureServiceLinkedRoles`
-- **Backed by:** `EnsureServiceLinkedRolesLambda`
-- **Role in stack:** First gate in the deployment sequence. Both `ECSCluster` and `ALB` have `DependsOn: EnsureServiceLinkedRoles`, so neither can be created until IAM service-linked roles are confirmed present. This is a silent pre-flight check that runs once per stack creation or update.
-
----
-
-#### `UploadFilesToS3`
-- **Type:** `Custom::UploadFilesToS3`
-- **Backed by:** `UploadFilesLambda`
-- **Properties passed:** `BucketName`, `ZipKey` (`app.zip`), `Version` (bound to `DeployVersion` parameter)
-- **Role in stack:** Acts as the trigger for file upload. CloudFormation treats this like any other resource — it waits for the Lambda to respond before proceeding to create `CodeBuildProject`. The `Version` property ensures CloudFormation re-invokes the Lambda (and therefore re-uploads `app.zip`) whenever `DeployVersion` changes.
-
----
-
-#### `WaitForBuild`
-- **Type:** `Custom::WaitForBuild`
-- **Backed by:** `WaitForBuildLambda`
-- **Properties passed:** `ProjectName` (CodeBuild project name), `Version` (bound to `DeployVersion` parameter)
-- **DependsOn:** `CodeBuildProject`, `UploadFilesToS3`
-- **Role in stack:** This is the primary synchronization point of the entire stack. CloudFormation is blocked here until the CodeBuild build finishes. `ECSService` has `DependsOn: WaitForBuild`, guaranteeing the Docker image is in ECR before ECS tries to pull it.
-
----
-
-#### `ForceECSDeployment`
-- **Type:** `Custom::ForceECSDeployment`
-- **Backed by:** `ForceDeployLambda`
-- **Properties passed:** `ClusterName`, `ServiceName`, `Version` (bound to `DeployVersion` parameter)
-- **DependsOn:** `ECSService`, `WaitForBuild`
-- **Role in stack:** Final step of every deployment. Runs after the ECS service is up and the build is confirmed complete. Triggers a forced redeployment so ECS always pulls the latest ECR image. The `Version` property ensures this custom resource re-runs on every stack update where `DeployVersion` is incremented.
-
----
-
-### 4.7 Build Pipeline
-
-#### `CodeBuildProject`
-- **Type:** `AWS::CodeBuild::Project`
-- **Name:** `{AppName}-build`
-- **Environment:** `LINUX_CONTAINER` / `standard:7.0` / `BUILD_GENERAL1_SMALL`
-- **Privileged Mode:** `true` (required for Docker daemon inside CodeBuild)
-- **Source:** S3 — `{SourceBucket}/app.zip`
-- **Build phases:**
-
-| Phase | Commands |
+| Phase | What Runs |
 |---|---|
-| `pre_build` | Login to ECR via `get-login-password`; set `VERSION_TAG` to current timestamp (`date +%Y%m%d%H%M%S`) |
-| `build` | `docker build` the image, tag as `:latest`; `docker tag` the same image with `:{VERSION_TAG}` |
-| `post_build` | `docker push` both `:latest` and `:{VERSION_TAG}` tags to ECR |
+| `pre_build` | Logs into ECR with `aws ecr get-login-password`; sets `VERSION_TAG` to the current date/time |
+| `build` | Runs `docker build` on the Dockerfile; tags the image as both `:latest` and `:{VERSION_TAG}` |
+| `post_build` | Runs `docker push` for both tags to ECR |
 
-- **Environment Variables injected:** `AWS_DEFAULT_REGION`, `AWS_ACCOUNT_ID`, `ECR_REGISTRY`, `ECR_REPO_URI`
-- **Logs:** Sent to CloudWatch log group `/codebuild/{AppName}`
-- **DependsOn:** `UploadFilesToS3` (source file must exist in S3 before the project is created)
+Environment variables injected: `AWS_DEFAULT_REGION`, `AWS_ACCOUNT_ID`, `ECR_REGISTRY`, `ECR_REPO_URI`
 
----
-
-### 4.8 Load Balancer
-
-#### `ALB`
-- **Type:** `AWS::ElasticLoadBalancingV2::LoadBalancer`
-- **Scheme:** `internet-facing`
-- **Subnets:** Both public subnets (spans 2 AZs for high availability)
-- **DependsOn:** `IGWAttachment` + `EnsureServiceLinkedRoles` — ensures both the internet gateway is attached and the ELB service-linked role exists before the ALB is created
+Build logs: CloudWatch log group `/codebuild/{AppName}`
 
 ---
 
-#### `ALBTargetGroup`
-- **Type:** `AWS::ElasticLoadBalancingV2::TargetGroup`
-- **Target Type:** `ip` (required for Fargate — tasks register by IP, not instance ID)
-- **Health Check:** `GET /` every 15s; timeout 5s; 2 consecutive passes = healthy; 3 fails = unhealthy
-- **Health Check Matcher:** `200-399` *(accepts redirects — not just strict 200)*
-- **Port:** 80 / HTTP
-- **Deregistration Delay:** 10 seconds (reduced from the AWS default of 300s to speed up task replacement during deployments)
+### 4.8 Load Balancer (ALB)
 
----
+**ALB** (`AWS::ElasticLoadBalancingV2::LoadBalancer`)
+Name: `{AppName}-alb`. Internet-facing, type `application`. Spans both public subnets for high availability. DependsOn `IGWAttachment` and `EnsureServiceLinkedRoles`.
 
-#### `ALBListener`
-- **Type:** `AWS::ElasticLoadBalancingV2::Listener`
-- **Protocol:** HTTP / Port 80
-- **Action:** Forward all traffic to `ALBTargetGroup`
+**ALB Target Group** (`AWS::ElasticLoadBalancingV2::TargetGroup`)
+Name: `{AppName}-tg`. Target type: `ip` — required for Fargate because tasks register by IP address, not by EC2 instance ID. Health check settings: `GET /` every 15 seconds, 5-second timeout, 2 consecutive passes to be healthy, 3 consecutive failures to be unhealthy. Matcher: `200-399` (accepts redirects). Deregistration delay: 10 seconds (reduced from the default 300 seconds to make deployments faster).
+
+**ALB Listener** (`AWS::ElasticLoadBalancingV2::Listener`)
+Listens on port 80 / HTTP. Default action: forward all requests to the target group.
 
 ---
 
 ### 4.9 ECS Compute
 
-#### `ECSCluster`
-- **Type:** `AWS::ECS::Cluster`
-- **Name:** `{AppName}-cluster`
-- **Capacity Provider:** `FARGATE` (serverless — no EC2 instances to manage), set as the default capacity provider strategy with weight `1`
-- **DependsOn:** `EnsureServiceLinkedRoles` (the ECS service-linked role must exist before a cluster can be created in a fresh account)
-- **Purpose:** Logical grouping for ECS services and tasks.
+**ECS Cluster** (`AWS::ECS::Cluster`)
+Name: `{AppName}-cluster`. DependsOn `EnsureServiceLinkedRoles`. Capacity provider: `FARGATE` — serverless, no EC2 instances to manage.
+
+**ECS Task Definition** (`AWS::ECS::TaskDefinition`)
+Family: `{AppName}-task`. Network mode: `awsvpc` (each task gets its own network interface and private IP). CPU: `256` units. Memory: `512` MB. Image: `{AccountId}.dkr.ecr.{Region}.amazonaws.com/{AppName}-repo:latest`. Container port: `80`. Log driver: `awslogs` → sends output to `/ecs/{AppName}` in CloudWatch. Execution role: `ECSTaskExecutionRole`.
+
+**ECS Service** (`AWS::ECS::Service`)
+Name: `{AppName}-service`. DependsOn: `ALBListener` and `WaitForBuild` (both must be complete before ECS can start). Launch type: `FARGATE`. Desired count: `1`. Health check grace period: 60 seconds — gives the container time to fully start before ALB begins checking it. Network: deploys in both public subnets with public IPs assigned; uses `ECSSecurityGroup`. Load balancer: registers container port 80 into the target group.
 
 ---
 
-#### `ECSTaskDefinition`
-- **Type:** `AWS::ECS::TaskDefinition`
-- **Network Mode:** `awsvpc` (each task gets its own ENI and IP)
-- **CPU / Memory:** `256` vCPU units / `512` MB
-- **Image:** `{AccountId}.dkr.ecr.{Region}.amazonaws.com/{AppName}-repo:latest`
-- **Container Port:** 80
-- **Log Driver:** `awslogs` → sends logs to `/ecs/{AppName}` CloudWatch log group with stream prefix `ecs`
-- **Execution Role:** `ECSTaskExecutionRole` (allows ECR pull + CloudWatch logging)
+### 4.10 Logging (CloudWatch)
+
+**ECS Log Group** (`AWS::Logs::LogGroup`)
+Name: `/ecs/{AppName}`. Retention: 7 days. All stdout/stderr from the NGINX container is sent here automatically by the `awslogs` log driver configured in the task definition. Each container instance writes to its own log stream, prefixed with `ecs/`.
+
+CodeBuild logs go to a separate group: `/codebuild/{AppName}` (created automatically by CodeBuild, not explicitly in the template).
 
 ---
 
-#### `ECSService`
-- **Type:** `AWS::ECS::Service`
-- **Name:** `{AppName}-service`
-- **Launch Type:** `FARGATE`
-- **Desired Count:** `1`
-- **DependsOn:** `ALBListener` + `WaitForBuild` *(both must complete before ECS starts)*
-- **Health Check Grace Period:** 60 seconds (gives the container time to start before ALB marks it unhealthy)
-- **Network:** Deploys tasks in both public subnets; assigns public IPs (`AssignPublicIp: ENABLED`); uses `ECSSecurityGroup`
-- **Load Balancer Registration:** Registers container port 80 into `ALBTargetGroup`
+## 5. How Everything Depends on Each Other
 
----
-
-### 4.10 Observability
-
-#### `ECSLogGroup`
-- **Type:** `AWS::Logs::LogGroup`
-- **Log Group Name:** `/ecs/{AppName}`
-- **Retention:** 7 days
-- **Purpose:** Captures all stdout/stderr from the NGINX container. Accessible via CloudWatch Logs console or CLI for debugging.
-
-> CodeBuild build logs are written to a separate log group: `/codebuild/{AppName}`, configured directly on the `CodeBuildProject` resource.
-
----
-
-## 5. Inter-Service Dependency Map
+Reading this map tells you why things have to happen in the order they do:
 
 ```
-SourceBucket ◄────────────────────────────────────────────────────────────────────┐
-     │                                                                             │
-     ▼                                                                             │
-UploadLambdaRole ──► UploadFilesLambda ──► UploadFilesToS3 (Custom Resource)      │
-                                                   │ writes app.zip to ──────────► │
-                                                   ▼
-                                          CodeBuildProject
-                                                   │
-               BuildLambdaRole ──► WaitForBuildLambda
-                                                   │
-                                          WaitForBuild (Custom Resource)
-                                         [triggers build + polls until done]
-                                                   │
-                          ECRRepository ◄──── CodeBuild pushes :latest + :timestamp
-                                 │
-                                 └──────────────────────────────────────┐
-                                                                        ▼
-SetupLambdaRole ──► EnsureServiceLinkedRolesLambda                ECSTaskDefinition
-                           │                                            │
-                  EnsureServiceLinkedRoles (Custom Resource)            ▼
-                           │                                        ECSCluster (DependsOn SLR)
-                           ├──────────────────────────────────────► ECSService
-                           │                                            │
-VPC ──► Subnets ──► RouteTable ──► IGW                                  │
-          │                                                             │
-          ▼                                                             │
-ALBSecurityGroup ──► ALB (DependsOn IGW + SLR) ──► ALBTargetGroup      │
-ECSSecurityGroup ──►─────────────────────────────► ALBListener ────────►│
-                                                                        │
-                                             ECSLogGroup ◄──────────────┤
-                                        ECSTaskExecutionRole ◄──────────┘
-                                                        │
-                                                        ▼
-                              ForceDeployLambdaRole ──► ForceDeployLambda
-                                                        │
-                                               ForceECSDeployment (Custom Resource)
-                                             [DependsOn: ECSService + WaitForBuild]
-                                             [Forces ECS to pull latest ECR image]
+SourceBucket
+    │
+    ├──► UploadFilesLambda (DependsOn SourceBucket)
+    │         │
+    │         ▼
+    │    UploadFilesToS3 (Custom Resource → uploads app.zip)
+    │         │
+    │         ▼
+    │    CodeBuildProject (DependsOn UploadFilesToS3)
+    │         │
+    │         ▼
+    │    WaitForBuild (Custom Resource → starts build, polls until done)
+    │         │
+    │         ├──► ECSService (DependsOn ALBListener + WaitForBuild)
+    │         │         │
+    │         │         ▼
+    │         │    ForceECSDeployment (Custom Resource → forces redeploy)
+    │         │
+    │         └──► ECRRepository ◄─── CodeBuild pushes image here
+
+VPC ──► Subnets
+           │
+           ├──► ALBSecurityGroup
+           ├──► ECSSecurityGroup
+           └──► IGWAttachment ──► PublicRoute
+
+EnsureServiceLinkedRoles (Custom Resource)
+    │   (runs first — creates ECS + ELB IAM service-linked roles)
+    │
+    ├──► ALB (DependsOn IGWAttachment + EnsureServiceLinkedRoles)
+    │         │
+    │         ▼
+    │    ALBTargetGroup ──► ALBListener ──► ECSService
+    │
+    └──► ECSCluster (DependsOn EnsureServiceLinkedRoles)
+              │
+              └──► ECSTaskDefinition ──► ECSService
 ```
 
 ---
 
 ## 6. Parameters
 
-| Parameter | Default | Required | Description |
-|---|---|---|---|
-| `AppName` | *(none — must be provided)* | Yes | Base name prefix applied to every resource. Change this to deploy multiple isolated instances of the stack in the same account. All resource names follow `{AppName}-{resource-type}`. |
-| `CheckAcknowledgement` | `TRUE` | No | Accepts `TRUE` or `FALSE`. Acknowledges that `CAPABILITY_IAM` is required for this stack. Defaults to `TRUE`. |
-| `DeployVersion` | *(none — must be provided)* | Yes | Must be incremented by 1 every time application content changes (e.g., `index.html` or `Dockerfile`). Changing this value forces the full pipeline to re-run: the Upload Lambda re-uploads `app.zip`, CodeBuild rebuilds the image, ECR receives the new image, and the Force Deploy Lambda triggers ECS to pull it. **Without incrementing this value, CloudFormation will skip all downstream custom resource steps even if source content was changed.** |
-
-> **Naming convention:** All resources follow `{AppName}-{resource-type}[-{qualifier}]`. For example: `nginx-app-alb`, `nginx-app-cluster`, `nginx-app-source-{accountId}-{region}`.
+| Parameter | Default | What It Does |
+|---|---|---|
+| `AppName` | *(required)* | The name prefix applied to every resource the stack creates. For example, if `AppName` is `nginx-app`, your cluster will be `nginx-app-cluster`, your S3 bucket will be `nginx-app-source-{accountId}-{region}`, and so on. Don't change this on a running stack. |
+| `CheckAcknowledgement` | `TRUE` | Confirmation that the stack needs IAM permissions. Leave it as `TRUE`. |
+| `DeployVersion` | *(required)* | A version number you control. **Every time you change application content — the `index.html`, the Dockerfile, or anything else — increment this by 1.** Changing this value is what tells CloudFormation to re-run the Upload Lambda, rebuild the Docker image, push it to ECR, and force a fresh ECS deployment. Without incrementing it, CloudFormation sees no change and skips all those steps — your update will never reach the running container. |
 
 ---
 
 ## 7. Outputs
 
-| Output Key | Description | Usage |
+| Output Key | What It Contains | How to Use It |
 |---|---|---|
-| `ApplicationURL` | `http://{ALB DNS Name}` | Open in browser immediately after `CREATE_COMPLETE` |
-| `SourceBucketName` | S3 bucket name | For debugging — confirm `app.zip` was uploaded by the Upload Lambda |
-| `ECRRepositoryURI` | Full ECR URI (`{AccountId}.dkr.ecr.{Region}.amazonaws.com/{AppName}-repo`) | Use for manual `docker pull` / `docker push` during testing or debugging |
-| `DeployVersionUsed` | The `DeployVersion` parameter value used in the current deployment | Reference to confirm which version is deployed; increment this value to trigger the next full pipeline run |
+| `ApplicationURL` | `http://{ALB DNS Name}` | Open this in a browser once the stack shows `CREATE_COMPLETE`. This is your live application. |
+| `SourceBucketName` | The full S3 bucket name | Useful for debugging — you can check here to confirm `app.zip` was uploaded successfully. |
+| `ECRRepositoryURI` | Full ECR repository URI | Use this for manual `docker pull` or `docker push` commands during testing or debugging. |
+| `DeployVersionUsed` | The `DeployVersion` value from this deployment | Helpful reference to know which version is currently running, especially when rolling back. |
 
 ---
 
-## 8. IAM Permission Summary
+## 8. IAM Permissions Summary
 
-| Role | Principal | Key Permissions | Scope |
+| Role | Used By | Key Permissions | Scope |
 |---|---|---|---|
-| `SetupLambdaRole` | `lambda.amazonaws.com` | `iam:CreateServiceLinkedRole`, `iam:GetRole`, CloudWatch logs | `*` (IAM SLR creation requires broad scope) |
-| `UploadLambdaRole` | `lambda.amazonaws.com` | `s3:PutObject`, `s3:DeleteObject`, CloudWatch logs | Source bucket only |
-| `CodeBuildRole` | `codebuild.amazonaws.com` | ECR auth token + ECR push actions, S3 read, CloudWatch logs | ECR auth: `*` (AWS requirement); ECR push: repository ARN only; S3: bucket only |
-| `ECSTaskExecutionRole` | `ecs-tasks.amazonaws.com` | ECR pull + CloudWatch logs | Managed policy (`AmazonECSTaskExecutionRolePolicy`) |
-| `BuildLambdaRole` | `lambda.amazonaws.com` | `codebuild:StartBuild`, `codebuild:BatchGetBuilds`, CloudWatch logs | CodeBuild project ARN only |
-| `ForceDeployLambdaRole` | `lambda.amazonaws.com` | `ecs:UpdateService`, `ecs:DescribeServices`, CloudWatch logs | ECS service ARN + ECS cluster ARN only |
+| `SetupLambdaRole` | EnsureServiceLinkedRolesLambda | `iam:CreateServiceLinkedRole`, `iam:GetRole` | All resources (`*`) — required because service-linked roles don't support resource-level ARN scoping |
+| `UploadLambdaRole` | UploadFilesLambda | `s3:PutObject`, `s3:DeleteObject` | Source S3 bucket only |
+| `CodeBuildRole` | CodeBuildProject | ECR auth token + push actions; `s3:GetObject` | ECR auth: `*` (AWS limitation); ECR push: repository ARN only; S3: bucket only |
+| `ECSTaskExecutionRole` | ECS tasks | Pull from ECR; write logs to CloudWatch | AWS managed policy |
+| `BuildLambdaRole` | WaitForBuildLambda | `codebuild:StartBuild`, `codebuild:BatchGetBuilds` | Specific CodeBuild project ARN only |
+| `ForceDeployLambdaRole` | ForceDeployLambda | `ecs:UpdateService`, `ecs:DescribeServices` | Specific ECS service and cluster ARNs only |
 
-> **Note on `ecr:GetAuthorizationToken` with `Resource: *`** — This is an AWS requirement. The ECR auth token API does not support resource-level restrictions. All other ECR actions (push/pull) are scoped to the specific repository ARN.
-
----
-
-## 9. Failure Points & Troubleshooting
-
-### Stack gets stuck at `EnsureServiceLinkedRoles`
-
-This custom resource runs first in every deployment. If it fails:
-
-1. Check CloudWatch Logs: `/aws/lambda/{AppName}-ensure-slr`
-2. Common causes: Lambda execution role not yet propagated (rare IAM race condition immediately after role creation); insufficient permissions on the `SetupLambdaRole` to call `iam:CreateServiceLinkedRole`
-3. If the SLR already exists from a prior deployment, the Lambda should return success immediately — check logs to confirm the `get_role` call succeeded
+**Why `ecr:GetAuthorizationToken` uses `Resource: *`:** This is an AWS constraint. The ECR token API doesn't support resource-level restrictions — you can't scope it to a single repository. All actual image push actions are scoped to the specific repository ARN.
 
 ---
 
-### Stack gets stuck at `WaitForBuild`
+## 9. What Can Go Wrong and How to Fix It
 
-The Lambda polls CodeBuild for up to ~14 minutes. If it's taking long, check:
+### Stack gets stuck at `WaitForBuild` for a long time
 
-1. **CodeBuild Console** → Find project `{AppName}-build` → View build logs
-2. Common causes: ECR Public Gallery pull throttled or unavailable, ECR auth failure, S3 source not found, Docker build error in `index.html` or `Dockerfile`
-3. If Lambda timed out: Check CloudWatch log group `/aws/lambda/{AppName}-wait-for-build`
+This Lambda polls for up to about 14 minutes. If it's taking unusually long:
+
+1. Go to **CodeBuild → Projects → `{AppName}-build`** and open the build logs.
+2. Common causes: Docker Hub rate limit (shouldn't happen since we use ECR Public Gallery, but check), ECR authentication failure, or `app.zip` not found in S3.
+3. If the Lambda itself timed out, check its logs at **CloudWatch → Log Groups → `/aws/lambda/{AppName}-wait-for-build`**.
 
 ---
 
-### ECS Service shows 0 running tasks
+### ECS service shows 0 running tasks
 
-1. Check ECS task stopped reason in console (Events tab on the service)
+1. Go to **ECS → Clusters → `{AppName}-cluster` → Services → `{AppName}-service` → Tasks tab**.
+2. Click a stopped task to see the stopped reason.
+3. Common causes:
+   - ECR image not found — the build may have failed but `WaitForBuild` missed it somehow. Check CodeBuild logs.
+   - ECS task can't reach ECR — make sure the ECS security group allows outbound traffic (it does by default) and the subnets have a route to the internet gateway.
+   - Out of memory — 512 MB is the minimum needed; increasing it won't hurt.
+
+---
+
+### ALB health checks failing (tasks keep getting replaced)
+
+1. Check container logs: **CloudWatch → Log Groups → `/ecs/{AppName}`**.
 2. Common causes:
-   - ECR image not found (build failed silently — recheck `WaitForBuild` logs)
-   - ECSSecurityGroup blocking outbound (requires port 443 for ECR pull)
-   - Task running out of memory (increase `Memory` in task definition)
-
----
-
-### ALB health checks failing (service loops)
-
-1. Check container logs in CloudWatch: `/ecs/{AppName}`
-2. Common causes:
-   - Container returning non-2xx/3xx (currently `Matcher: 200-399` handles most cases)
-   - NGINX permission issue (the `chmod 644` in Dockerfile handles this)
-   - Container not started yet — grace period is 60s; ALB starts checking after that
+   - Container is returning a non-200/3xx response. The matcher is set to `200-399`, which should handle most cases.
+   - NGINX file permission issue. The Dockerfile applies `chmod 644` to `index.html` — if this step was skipped or failed, NGINX will return 403.
+   - Container hasn't fully started yet. The 60-second grace period should cover this, but if startup is slower than expected, you may need to increase it in the ECS service definition.
 
 ---
 
 ### `UploadFilesToS3` custom resource fails
 
-1. Check CloudWatch Logs: `/aws/lambda/{AppName}-upload-files`
+1. Check **CloudWatch → Log Groups → `/aws/lambda/{AppName}-upload-files`**.
 2. Common causes:
-   - IAM role not yet propagated (rare race condition — retry deployment)
-   - S3 bucket name conflict (bucket already exists from a previous deployment in the same account/region)
+   - S3 bucket already exists from a previous deployment with the same `AppName` and account/region combination (S3 bucket names are global and must be unique).
+   - IAM role not propagated yet — very rare, but try redeploying if this happens on a fresh account right after the role is created.
+
+---
+
+### `EnsureServiceLinkedRoles` custom resource fails
+
+1. Check **CloudWatch → Log Groups → `/aws/lambda/{AppName}-ensure-slr`**.
+2. Common cause: The Lambda's IAM role (`SetupLambdaRole`) doesn't have permission to call `iam:CreateServiceLinkedRole`. Verify the role was created correctly in IAM.
 
 ---
 
 ### `ForceECSDeployment` custom resource fails
 
-1. Check CloudWatch Logs: `/aws/lambda/{AppName}-force-deploy`
-2. Common causes:
-   - ECS service not yet stable when Lambda runs (rare timing issue — retry the stack update)
-   - `ForceDeployLambdaRole` missing `ecs:UpdateService` permission (should not occur if stack was deployed cleanly)
-3. Note: A failure here does not mean the container is broken — it means the forced redeploy was not issued. The ECS service may still be running the previous image. Manually trigger a new deployment from the ECS console if needed.
+1. Check **CloudWatch → Log Groups → `/aws/lambda/{AppName}-force-deploy`**.
+2. Common cause: ECS service doesn't exist yet (unlikely given the `DependsOn`, but possible if the service creation failed). Also check that the `ForceDeployLambdaRole` has `ecs:UpdateService` permission on the correct service ARN.
 
 ---
 
-### Application content not updating after a stack update
+## 10. Design Decisions Worth Knowing
 
-The most common cause is **not incrementing `DeployVersion`**. CloudFormation detects changes to resources by comparing property values. If `DeployVersion` is unchanged, CloudFormation considers `UploadFilesToS3`, `WaitForBuild`, and `ForceECSDeployment` as already up-to-date and skips them — even if the Lambda source code was edited.
+### Why ECR Public Gallery instead of Docker Hub
 
-**Fix:** Always increment `DeployVersion` by 1 with every content change before submitting a stack update.
-
----
-
-## 10. Known Design Decisions & Fixes
-
-### Fix 1 — NGINX 403 on every request
-
-**Root cause:** The Dockerfile used `RUN rm -rf /usr/share/nginx/html/*` which wiped inherited directory permissions. The `COPY`-ed `index.html` ended up owned by `root:root` with mode `600`. The NGINX worker process runs as uid `nginx` and could not read the file.
-
-**Fix applied in template:**
-```dockerfile
-COPY index.html /usr/share/nginx/html/index.html
-RUN chmod 644 /usr/share/nginx/html/index.html
-```
+The Dockerfile pulls the NGINX base image from `public.ecr.aws/nginx/nginx:1.29` rather than Docker Hub. Docker Hub limits anonymous pulls to 100 per 6 hours per IP address. CodeBuild runs on shared AWS infrastructure with shared NAT IPs, so it's easy to hit those limits and have builds fail mid-pipeline. The ECR Public Gallery has no such restrictions for AWS services.
 
 ---
 
-### Fix 2 — ALB health checks failing on redirects
+### Why NGINX needs `chmod 644`
 
-**Root cause:** Default ALB health check matcher only accepts HTTP `200`. If NGINX returned any `3xx` redirect, the task was marked unhealthy and killed in a loop.
-
-**Fix applied in template:**
-```json
-"Matcher": { "HttpCode": "200-399" }
-```
+The Dockerfile removes all files from `/usr/share/nginx/html/` first (`RUN rm -rf /usr/share/nginx/html/*`), then copies in the custom `index.html`. When files are copied via `COPY` in Docker, they're owned by `root:root` with mode `644` by default — but the `rm -rf` step can strip inherited directory permissions. Without the explicit `chmod 644`, the NGINX worker process (which runs as the `nginx` user, not root) can't read the file and returns HTTP 403 on every request. The fix is the explicit permission step.
 
 ---
 
-### Fix 3 — CAPABILITY_NAMED_IAM removed
+### Why the ALB health check matcher is `200-399`
 
-**Root cause:** All IAM roles originally had explicit `RoleName` properties which triggered the `CAPABILITY_NAMED_IAM` requirement. CloudLabs deployment does not pass this capability.
-
-**Fix applied in template:** All `RoleName:` lines removed from all six IAM roles: `SetupLambdaRole`, `UploadLambdaRole`, `CodeBuildRole`, `ECSTaskExecutionRole`, `BuildLambdaRole`, and `ForceDeployLambdaRole`. CloudFormation now auto-generates role names. All cross-references use `Fn::GetAtt` / `Ref` on logical IDs and are unaffected.
+The default ALB health check only accepts HTTP `200`. If NGINX returns any redirect (`301`, `302`, `307`), the ALB marks the task as unhealthy and kills it — triggering an endless replacement loop. Setting the matcher to `200-399` accepts all successful and redirect responses as healthy.
 
 ---
 
-### Fix 4 — ECS/ELB service-linked role race condition in new accounts
+### Why IAM role names are auto-generated
 
-**Root cause:** Brand-new AWS accounts do not have the `AWSServiceRoleForECS` or `AWSServiceRoleForElasticLoadBalancing` roles pre-created. Attempting to create an ECS cluster or ALB in such accounts fails with an IAM role not found error.
-
-**Fix applied in template:** Added `EnsureServiceLinkedRolesLambda` and the `EnsureServiceLinkedRoles` custom resource. Both `ECSCluster` and `ALB` now have `DependsOn: EnsureServiceLinkedRoles`. The Lambda also enforces a 30-second wait after creation to allow IAM propagation across regions.
+All six IAM roles in this template have no `RoleName` property. CloudFormation auto-generates names for them. This is intentional: hardcoded role names require `CAPABILITY_NAMED_IAM` when deploying, which some automated lab and CI platforms don't pass. Auto-generated names only require `CAPABILITY_IAM`, which is much more widely supported. All internal cross-references between resources use `!GetAtt` and `!Ref` on logical resource IDs, so they work fine regardless of what name CloudFormation assigns.
 
 ---
 
-### Fix 5 — ECS not pulling updated image after rebuild
+### Why `DeployVersion` exists
 
-**Root cause:** The `ECSTaskDefinition` always references `:latest`. When a new image is pushed to ECR, the task definition does not change, so CloudFormation does not trigger a new ECS deployment.
-
-**Fix applied in template:** Added `ForceDeployLambda` and the `ForceECSDeployment` custom resource (triggered last, after `ECSService` and `WaitForBuild`). This issues `ecs:UpdateService` with `forceNewDeployment: true` on every stack update where `DeployVersion` is incremented, ensuring ECS always pulls the freshly built image.
+CloudFormation only re-triggers a Custom Resource Lambda when at least one of its declared properties changes. If you update the Lambda code (for example, changing the `index.html` content inside `UploadFilesLambda`) but don't change any property of the `UploadFilesToS3` Custom Resource, CloudFormation won't call the Lambda again — it assumes nothing changed. The `Version` property, which maps to the `DeployVersion` parameter, is the deliberately-included "force trigger." Incrementing it by 1 on every content update makes CloudFormation see a property change, which triggers the Lambda call, which re-uploads the ZIP, which causes CodeBuild to rebuild, which causes ECS to redeploy.
 
 ---
 
-## 11. Re-Deployment Checklist
+## 11. Checklist Before Deploying
 
-Use this checklist before deploying the stack in a new environment or after making template changes.
+Use this before deploying into any new account or region.
 
-- [ ] `AppName` parameter is set to a unique value if deploying multiple stacks in the same account
-- [ ] `DeployVersion` has been incremented by 1 if any application content (`index.html`, `Dockerfile`) has changed
-- [ ] Target AWS region supports ECS Fargate, CodeBuild standard:7.0, and ECR
-- [ ] No existing S3 bucket named `{AppName}-source-{AccountId}-{Region}` (S3 names are global)
+- [ ] `AppName` is set — and if running multiple stacks in the same account, each one has a unique value
+- [ ] `DeployVersion` is set to a number (start at `1` for a new deployment)
+- [ ] `CheckAcknowledgement` is `TRUE`
+- [ ] The target AWS region supports ECS Fargate, CodeBuild `standard:7.0`, and ECR
+- [ ] No existing S3 bucket named `{AppName}-source-{AccountId}-{Region}` — S3 names must be globally unique
 - [ ] No existing ECR repository named `{AppName}-repo` in the target region
-- [ ] CloudFormation is being deployed with at least `CAPABILITY_IAM`
-- [ ] Lambda execution roles have no existing name conflict (auto-generated, so this is safe)
-- [ ] Account has not hit ECS Fargate vCPU limits in the target region
-- [ ] Account ECR image scan results reviewed after first build (scan-on-push is enabled)
-- [ ] ALB DNS name from `ApplicationURL` output tested in browser after `CREATE_COMPLETE`
-- [ ] CloudWatch log group `/ecs/{AppName}` is receiving logs (confirms container started correctly)
-- [ ] `ForceECSDeployment` custom resource shows `CREATE_COMPLETE` in CloudFormation Events (confirms ECS is running the latest image)
-
----
-
-*Last Updated: April 2026 | Maintained by: Charan kumar asam*
+- [ ] The deployment is being run with at least `CAPABILITY_IAM`
+- [ ] The account hasn't hit ECS Fargate CPU limits in the target region
+- [ ] After `CREATE_COMPLETE`, the `ApplicationURL` output opens and shows the NGINX page in a browser
+- [ ] CloudWatch log group `/ecs/{AppName}` is receiving logs, confirming the container started correctly
+- [ ] ECR scan results reviewed after the first build (scan-on-push is enabled and results appear in the ECR console)
