@@ -28,5 +28,49 @@
                 "Order": 6
             }
         ]
+    },
+    
+    {
+        "Name": "Guide for the contoso innovations azure devops lab",
+        "Language": "Spanish",
+        "Files": [
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/Lab%20overview.md",
+                "Order": 1
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task%20overview.md",
+                "Order": 2
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-1.md",
+                "Order": 3
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-2.md",
+                "Order": 4
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-3.md",
+                "Order": 5
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-4.md",
+                "Order": 6
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-5.md",
+                "Order": 7
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-6.md",
+                "Order": 8
+            },
+            {
+                "RawFilePath": "https://raw.githubusercontent.com/charankumar2104/Practice-Lab-Task-Guide/refs/heads/main/task-7.md",
+                "Order": 9
+            }
+        ]
     }
+
 ]
